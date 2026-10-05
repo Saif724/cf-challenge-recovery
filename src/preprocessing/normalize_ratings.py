@@ -1,221 +1,149 @@
-import json
 from pathlib import Path
+import json
 
 import pandas as pd
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-RAW_DIR = (
-    PROJECT_ROOT
-    / "data"
-    / "raw"
-)
-
-OUTPUT_FILE = (
+PILOT_FILE = (
     PROJECT_ROOT
     / "data"
     / "processed"
-    / "ratings.parquet"
+    / "pilot_sample_200.parquet"
 )
 
+RATING_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "raw"
+    / "pilot"
+    / "rating_history"
+)
 
-def load_rating_history(path: Path):
-    with path.open("r", encoding="utf-8") as file:
-        return json.load(file)
+OUTPUT_DIR = (
+    PROJECT_ROOT
+    / "data"
+    / "processed"
+)
+
+OUTPUT_FILE = OUTPUT_DIR / "pilot_rating_history.parquet"
 
 
-def normalize(handle: str, rating_history):
-    rows = []
+def normalize_rating(handle: str, row: dict) -> dict:
+    contest_time = row.get("ratingUpdateTimeSeconds")
 
-    for record in rating_history:
-        rows.append(
-            {
-                "handle": handle,
-                "contest_id": record.get("contestId"),
-                "contest_name": record.get("contestName"),
-                "contest_rank": record.get("rank"),
-                "rating_update_time_seconds": record.get(
-                    "ratingUpdateTimeSeconds"
-                ),
-                "old_rating": record.get("oldRating"),
-                "new_rating": record.get("newRating"),
-            }
+    if contest_time is not None:
+        contest_datetime = pd.to_datetime(
+            contest_time,
+            unit="s",
+            utc=True,
         )
+    else:
+        contest_datetime = pd.NaT
 
-    return rows
+    return {
+        "handle": handle,
+        "contest_id": row.get("contestId"),
+        "contest_name": row.get("contestName"),
+        "rank": row.get("rank"),
+        "old_rating": row.get("oldRating"),
+        "new_rating": row.get("newRating"),
+        "rating_change": row.get("newRating", 0)
+        - row.get("oldRating", 0),
+        "contest_time": contest_datetime,
+        "contest_time_seconds": contest_time,
+    }
 
 
 def main():
-    user_dirs = sorted(
-        path
-        for path in RAW_DIR.iterdir()
-        if path.is_dir()
-        and (path / "rating_history.json").exists()
-    )
+    pilot = pd.read_parquet(PILOT_FILE)
 
-    if not user_dirs:
-        raise RuntimeError(
-            "No user rating histories found."
-        )
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    print(
-        f"Found {len(user_dirs)} users:"
-    )
+    rows = []
 
-    for user_dir in user_dirs:
-        print(f"  - {user_dir.name}")
+    print("=" * 70)
+    print("NORMALIZING PILOT RATING HISTORY")
+    print("=" * 70)
 
-    all_rows = []
+    for i, handle in enumerate(pilot["handle"], start=1):
+        path = RATING_DIR / f"{handle}.json"
 
-    print()
+        with path.open("r", encoding="utf-8") as f:
+            ratings = json.load(f)
 
-    for user_dir in user_dirs:
-        handle = user_dir.name
-        rating_file = user_dir / "rating_history.json"
-
-        try:
-            rating_history = load_rating_history(
-                rating_file
+        for row in ratings:
+            rows.append(
+                normalize_rating(
+                    handle,
+                    row,
+                )
             )
-        except Exception as exc:
-            print(
-                f"{handle}: ERROR loading rating history: "
-                f"{exc}"
-            )
-            continue
 
-        rows = normalize(
-            handle,
-            rating_history,
-        )
+        if i % 25 == 0 or i == len(pilot):
+            print(f"Processed: {i}/{len(pilot)}")
 
-        all_rows.extend(rows)
+    df = pd.DataFrame(rows)
 
-        print(
-            f"{handle}: "
-            f"loaded {len(rating_history)} records, "
-            f"normalized {len(rows)}"
-        )
-
-    if not all_rows:
-        raise RuntimeError(
-            "No rating records were normalized."
-        )
-
-    df = pd.DataFrame(all_rows)
-
-    # ---------------------------------------------------------
-    # Basic cleanup
-    # ---------------------------------------------------------
-
-    df["contest_id"] = pd.to_numeric(
-        df["contest_id"],
-        errors="coerce",
-    ).astype("Int64")
-
-    df["contest_rank"] = pd.to_numeric(
-        df["contest_rank"],
-        errors="coerce",
-    ).astype("Int64")
-
-    df["rating_update_time_seconds"] = pd.to_numeric(
-        df["rating_update_time_seconds"],
-        errors="coerce",
-    ).astype("Int64")
-
-    df["old_rating"] = pd.to_numeric(
-        df["old_rating"],
-        errors="coerce",
-    )
-
-    df["new_rating"] = pd.to_numeric(
-        df["new_rating"],
-        errors="coerce",
-    )
-
-    # ---------------------------------------------------------
-    # Sort
-    # ---------------------------------------------------------
-
-    df = df.sort_values(
-        [
-            "handle",
-            "rating_update_time_seconds",
-            "contest_id",
-        ]
-    ).reset_index(drop=True)
-
-    # ---------------------------------------------------------
-    # Integrity checks
-    # ---------------------------------------------------------
-
-    duplicate_mask = df.duplicated(
-        subset=[
-            "handle",
-            "contest_id",
-        ],
-        keep=False,
-    )
-
-    duplicate_count = int(
-        duplicate_mask.sum()
-    )
-
-    if duplicate_count:
-        print(
-            f"\nWARNING: {duplicate_count} rows belong "
-            "to duplicated handle/contest_id pairs."
-        )
-
-    # ---------------------------------------------------------
-    # Save
-    # ---------------------------------------------------------
-
-    OUTPUT_FILE.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    if not df.empty:
+        df = df.sort_values(
+            ["handle", "contest_time", "contest_id"]
+        ).reset_index(drop=True)
 
     df.to_parquet(
         OUTPUT_FILE,
         index=False,
     )
 
-    # ---------------------------------------------------------
-    # Diagnostics
-    # ---------------------------------------------------------
-
-    print("\n" + "=" * 70)
-    print("NORMALIZED RATINGS")
+    print()
+    print("=" * 70)
+    print("NORMALIZATION COMPLETE")
     print("=" * 70)
 
+    print(f"Rows: {len(df):,}")
+    print(f"Users: {df['handle'].nunique():,}")
+    print(f"Unique contests: {df['contest_id'].nunique():,}")
+
+    print()
+    print("=== TIME RANGE ===")
+    print("Earliest:", df["contest_time"].min())
+    print("Latest:", df["contest_time"].max())
+
+    print()
+    print("=== RATING ===")
     print(
-        f"Rows: {len(df):,}"
+        "Initial rating:",
+        df.groupby("handle")["old_rating"].first().describe()
     )
 
-    print(
-        f"Users: {df['handle'].nunique():,}"
+    print()
+    print("=== RATING CHANGE ===")
+    print(df["rating_change"].describe())
+
+    print()
+    print("=== CONTEST PARTICIPATION ===")
+
+    contests_per_user = (
+        df.groupby("handle")["contest_id"]
+        .nunique()
     )
 
-    print("\nRecords per user:")
+    print(contests_per_user.describe())
 
-    print(
-        df["handle"]
-        .value_counts()
-        .sort_index()
-        .to_string()
-    )
+    print()
+    print("Users with >= 5 contests:",
+          (contests_per_user >= 5).sum())
 
-    print("\nColumns:")
+    print("Users with >= 10 contests:",
+          (contests_per_user >= 10).sum())
 
-    print(
-        df.columns.tolist()
-    )
+    print("Users with >= 20 contests:",
+          (contests_per_user >= 20).sum())
 
-    print(
-        f"\nSaved: {OUTPUT_FILE}"
-    )
+    print()
+    print("Saved to:")
+    print(OUTPUT_FILE)
 
 
 if __name__ == "__main__":
